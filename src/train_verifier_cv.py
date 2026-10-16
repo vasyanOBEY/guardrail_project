@@ -2,17 +2,31 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.model_selection import RepeatedStratifiedKFold, cross_validate
 from sklearn.pipeline import FeatureUnion, Pipeline
 
 
 REQUIRED_COLUMNS = {"id", "prompt", "response", "label"}
+RANDOM_STATE = 42
+TAIL_CHARS = 8_000
+
+SPECIAL_TOKEN_RE = re.compile(
+    r"\b(?:[A-Za-zА-Яа-яЁё_]*\d[A-Za-zА-Яа-яЁё0-9_.:-]*|"
+    r"[A-Za-zА-Яа-яЁё0-9_.:-]*\d[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_.:-]*)\b"
+)
+NUMBER_RE = re.compile(r"(?<![\w])\d{2,}(?:[.,:/-]\d+)*(?![\w])")
+WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{4,}")
+TOOL_CALL_RE = re.compile(r"TOOL_CALL\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -38,7 +52,7 @@ def resolve_split(explicit_path: str | None, stem: str) -> Path:
 
     raise FileNotFoundError(
         f"Could not find data/{stem}.csv or data/{stem}.parquet. "
-        f"Pass the path explicitly with a command-line argument."
+        "Pass the path explicitly with a command-line argument."
     )
 
 
@@ -57,66 +71,155 @@ def validate(df: pd.DataFrame, name: str) -> pd.DataFrame:
         raise ValueError(f"{name}: label must contain only 0/1")
     if out["id"].duplicated().any():
         raise ValueError(f"{name}: duplicate ids found")
+    if out["prompt"].str.strip().eq("").any():
+        raise ValueError(f"{name}: empty prompt found")
+    if out["response"].str.strip().eq("").any():
+        raise ValueError(f"{name}: empty response found")
 
     return out
 
 
-def build_text(df: pd.DataFrame) -> pd.Series:
-    return "[PROMPT] " + df["prompt"] + " [RESPONSE] " + df["response"]
+def validate_split_separation(
+    train: pd.DataFrame,
+    threshold: pd.DataFrame,
+    holdout: pd.DataFrame,
+) -> None:
+    splits = {"train": train, "threshold": threshold, "holdout": holdout}
+    names = list(splits)
+
+    for i, left_name in enumerate(names):
+        for right_name in names[i + 1 :]:
+            left = splits[left_name]
+            right = splits[right_name]
+
+            id_overlap = set(left["id"]) & set(right["id"])
+            if id_overlap:
+                raise ValueError(
+                    f"Leakage: {left_name}/{right_name} share {len(id_overlap)} ids"
+                )
+
+            left_pairs = set(zip(left["prompt"], left["response"]))
+            right_pairs = set(zip(right["prompt"], right["response"]))
+            pair_overlap = left_pairs & right_pairs
+            if pair_overlap:
+                raise ValueError(
+                    f"Leakage: {left_name}/{right_name} share "
+                    f"{len(pair_overlap)} exact prompt/response pairs"
+                )
 
 
-def make_word_model(c_value: float) -> Pipeline:
-    return Pipeline(
-        [
-            (
-                "tfidf",
-                TfidfVectorizer(
-                    ngram_range=(1, 2),
-                    min_df=1,
-                    max_df=1.0,
-                    sublinear_tf=True,
-                    max_features=100_000,
-                ),
-            ),
-            (
-                "clf",
-                LogisticRegression(
-                    C=c_value,
-                    max_iter=3000,
-                    class_weight="balanced",
-                    random_state=42,
-                ),
-            ),
-        ]
+def _normalize_token(token: str) -> str:
+    return token.lower().strip(" \t\n\r.,;:!?()[]{}<>\"'")
+
+
+def support_signature(prompt: str, response: str) -> str:
+    """
+    Build cheap relational features available at inference time.
+
+    They do not use label/explanation. They only compare the candidate response
+    with its own prompt and therefore are safe for the hidden test.
+    """
+    prompt_lower = prompt.lower()
+
+    special_tokens = [_normalize_token(x) for x in SPECIAL_TOKEN_RE.findall(response)]
+    number_tokens = [_normalize_token(x) for x in NUMBER_RE.findall(response)]
+    tool_calls = [x.lower() for x in TOOL_CALL_RE.findall(response)]
+
+    unseen_specials = [x for x in special_tokens if x and x not in prompt_lower]
+    unseen_numbers = [x for x in number_tokens if x and x not in prompt_lower]
+    unseen_tools = [x for x in tool_calls if x and x not in prompt_lower]
+
+    response_words = {x.lower() for x in WORD_RE.findall(response)}
+    prompt_words = {x.lower() for x in WORD_RE.findall(prompt)}
+    overlap_ratio = (
+        len(response_words & prompt_words) / len(response_words)
+        if response_words
+        else 1.0
     )
+    overlap_bucket = min(9, int(overlap_ratio * 10))
+
+    features = [
+        "SUPPORT_SIGNATURE",
+        f"WORD_OVERLAP_{overlap_bucket}",
+        f"UNSEEN_SPECIAL_COUNT_{min(len(unseen_specials), 5)}",
+        f"UNSEEN_NUMBER_COUNT_{min(len(unseen_numbers), 5)}",
+        f"UNSEEN_TOOL_COUNT_{min(len(unseen_tools), 3)}",
+    ]
+
+    # Keep a few concrete unseen structured values. This is intentionally capped
+    # so a long response cannot explode the feature space.
+    features.extend(f"UNSEEN_SPECIAL_{x}" for x in unseen_specials[:8])
+    features.extend(f"UNSEEN_TOOL_{x}" for x in unseen_tools[:4])
+    return " ".join(features)
 
 
-def make_word_char_model(c_value: float) -> Pipeline:
-    features = FeatureUnion(
-        [
-            (
-                "word",
-                TfidfVectorizer(
-                    analyzer="word",
-                    ngram_range=(1, 2),
-                    min_df=1,
-                    max_df=1.0,
-                    sublinear_tf=True,
-                    max_features=100_000,
+def build_representation(df: pd.DataFrame, mode: str) -> pd.Series:
+    if mode == "full":
+        return "[PROMPT] " + df["prompt"] + " [RESPONSE] " + df["response"]
+
+    if mode == "response":
+        return "[RESPONSE] " + df["response"]
+
+    if mode == "tail8k":
+        return (
+            "[PROMPT_TAIL] "
+            + df["prompt"].str[-TAIL_CHARS:]
+            + " [RESPONSE] "
+            + df["response"]
+        )
+
+    if mode == "response_support":
+        values = []
+        for prompt, response in zip(df["prompt"], df["response"]):
+            values.append(
+                "[RESPONSE] "
+                + response
+                + " [RELATIONAL_FEATURES] "
+                + support_signature(prompt, response)
+            )
+        return pd.Series(values, index=df.index)
+
+    raise ValueError(f"Unknown representation: {mode}")
+
+
+def make_model(feature_kind: str, c_value: float) -> Pipeline:
+    if feature_kind == "word":
+        features = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            min_df=1,
+            max_df=1.0,
+            sublinear_tf=True,
+            max_features=50_000,
+        )
+    elif feature_kind == "word_char":
+        features = FeatureUnion(
+            [
+                (
+                    "word",
+                    TfidfVectorizer(
+                        analyzer="word",
+                        ngram_range=(1, 2),
+                        min_df=1,
+                        max_df=1.0,
+                        sublinear_tf=True,
+                        max_features=40_000,
+                    ),
                 ),
-            ),
-            (
-                "char",
-                TfidfVectorizer(
-                    analyzer="char_wb",
-                    ngram_range=(3, 5),
-                    min_df=1,
-                    sublinear_tf=True,
-                    max_features=150_000,
+                (
+                    "char",
+                    TfidfVectorizer(
+                        analyzer="char_wb",
+                        ngram_range=(3, 5),
+                        min_df=1,
+                        sublinear_tf=True,
+                        max_features=60_000,
+                    ),
                 ),
-            ),
-        ]
-    )
+            ]
+        )
+    else:
+        raise ValueError(f"Unknown feature kind: {feature_kind}")
 
     return Pipeline(
         [
@@ -127,30 +230,93 @@ def make_word_char_model(c_value: float) -> Pipeline:
                     C=c_value,
                     max_iter=3000,
                     class_weight="balanced",
-                    random_state=42,
+                    random_state=RANDOM_STATE,
                 ),
             ),
         ]
     )
 
 
-def evaluate_candidates(x_train: pd.Series, y_train: pd.Series) -> tuple[pd.DataFrame, dict]:
+def candidate_specs() -> list[dict]:
+    specs = [
+        {
+            "name": "legacy_full_word",
+            "representation": "full",
+            "feature_kind": "word",
+            "C": 1.0,
+        }
+    ]
+
+    # Response-only is a useful control: it tells us whether the dataset has
+    # strong answer-style signal. We do not assume it is the final architecture.
+    for c_value in (0.5, 1.0, 2.0):
+        specs.append(
+            {
+                "name": "response_word",
+                "representation": "response",
+                "feature_kind": "word",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "response_word_char",
+                "representation": "response",
+                "feature_kind": "word_char",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "tail8k_word",
+                "representation": "tail8k",
+                "feature_kind": "word",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "response_support_word_char",
+                "representation": "response_support",
+                "feature_kind": "word_char",
+                "C": c_value,
+            }
+        )
+
+    return specs
+
+
+def evaluate_candidates(
+    train: pd.DataFrame,
+    repeats: int,
+) -> tuple[pd.DataFrame, dict]:
+    y_train = train["label"]
     min_class = int(y_train.value_counts().min())
     n_splits = min(3, min_class)
     if n_splits < 2:
-        raise ValueError("Not enough examples in one of the classes for cross-validation.")
+        raise ValueError("Not enough examples in one class for cross-validation.")
 
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    cv = RepeatedStratifiedKFold(
+        n_splits=n_splits,
+        n_repeats=repeats,
+        random_state=RANDOM_STATE,
+    )
     scoring = {"f1": "f1", "precision": "precision", "recall": "recall"}
 
+    representation_cache: dict[str, pd.Series] = {}
     rows: list[dict] = []
-    candidates: list[tuple[str, float, Pipeline]] = []
 
-    for c_value in (0.5, 1.0, 2.0, 4.0):
-        candidates.append(("word_tfidf", c_value, make_word_model(c_value)))
-        candidates.append(("word_char_tfidf", c_value, make_word_char_model(c_value)))
+    for spec in candidate_specs():
+        representation = spec["representation"]
+        if representation not in representation_cache:
+            representation_cache[representation] = build_representation(
+                train, representation
+            )
 
-    for model_name, c_value, model in candidates:
+        x_train = representation_cache[representation]
+        model = make_model(spec["feature_kind"], float(spec["C"]))
+
+        started = time.perf_counter()
         scores = cross_validate(
             model,
             x_train,
@@ -160,48 +326,80 @@ def evaluate_candidates(x_train: pd.Series, y_train: pd.Series) -> tuple[pd.Data
             n_jobs=-1,
             return_train_score=False,
         )
+        wall_seconds = time.perf_counter() - started
+
         rows.append(
             {
-                "model": model_name,
-                "C": c_value,
+                **spec,
                 "cv_f1_mean": float(scores["test_f1"].mean()),
                 "cv_f1_std": float(scores["test_f1"].std()),
                 "cv_precision_mean": float(scores["test_precision"].mean()),
                 "cv_recall_mean": float(scores["test_recall"].mean()),
-                "cv_folds": n_splits,
+                "fit_time_mean_sec": float(scores["fit_time"].mean()),
+                "score_time_mean_sec": float(scores["score_time"].mean()),
+                "wall_time_sec": float(wall_seconds),
+                "cv_folds_total": int(n_splits * repeats),
             }
         )
 
     results = pd.DataFrame(rows).sort_values(
-        ["cv_f1_mean", "cv_precision_mean", "cv_recall_mean"],
-        ascending=[False, False, False],
+        ["cv_f1_mean", "cv_f1_std", "cv_precision_mean", "cv_recall_mean"],
+        ascending=[False, True, False, False],
     ).reset_index(drop=True)
 
     best = results.iloc[0].to_dict()
     return results, best
 
 
-def build_model(model_name: str, c_value: float) -> Pipeline:
-    if model_name == "word_tfidf":
-        return make_word_model(c_value)
-    if model_name == "word_char_tfidf":
-        return make_word_char_model(c_value)
-    raise ValueError(f"Unknown model: {model_name}")
+def get_git_commit() -> str:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+def split_summary(df: pd.DataFrame) -> dict:
+    prompt_len = df["prompt"].str.len()
+    response_len = df["response"].str.len()
+    return {
+        "rows": int(len(df)),
+        "positive": int((df["label"] == 1).sum()),
+        "negative": int((df["label"] == 0).sum()),
+        "prompt_chars_median": float(prompt_len.median()),
+        "prompt_chars_max": int(prompt_len.max()),
+        "response_chars_median": float(response_len.median()),
+        "response_chars_max": int(response_len.max()),
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Train and select an ML verifier using CV on train only. "
-            "Outputs raw id,score files for threshold and holdout; "
-            "threshold selection is intentionally left to the evaluator."
+            "Train/select an ML verifier using train-only CV. "
+            "Outputs raw id,score files. Final threshold belongs to the shared evaluator."
         )
     )
     parser.add_argument("--train", default=None)
     parser.add_argument("--threshold", default=None)
     parser.add_argument("--holdout", default=None)
     parser.add_argument("--outdir", default="outputs")
+    parser.add_argument(
+        "--cv-repeats",
+        type=int,
+        default=3,
+        help="Repeated 3-fold CV repeats on train only. Default: 3.",
+    )
     args = parser.parse_args()
+
+    if args.cv_repeats < 1:
+        raise ValueError("--cv-repeats must be >= 1")
 
     train_path = resolve_split(args.train, "split_train")
     threshold_path = resolve_split(args.threshold, "split_threshold")
@@ -210,17 +408,23 @@ def main() -> None:
     train = validate(read_table(train_path), "train")
     threshold = validate(read_table(threshold_path), "threshold")
     holdout = validate(read_table(holdout_path), "holdout")
+    validate_split_separation(train, threshold, holdout)
 
-    x_train = build_text(train)
-    y_train = train["label"]
+    cv_results, best = evaluate_candidates(train, repeats=args.cv_repeats)
 
-    cv_results, best = evaluate_candidates(x_train, y_train)
+    best_representation = str(best["representation"])
+    best_feature_kind = str(best["feature_kind"])
+    best_c = float(best["C"])
 
-    best_model = build_model(str(best["model"]), float(best["C"]))
-    best_model.fit(x_train, y_train)
+    best_model = make_model(best_feature_kind, best_c)
+    best_model.fit(build_representation(train, best_representation), train["label"])
 
-    threshold_scores = best_model.predict_proba(build_text(threshold))[:, 1]
-    holdout_scores = best_model.predict_proba(build_text(holdout))[:, 1]
+    threshold_scores = best_model.predict_proba(
+        build_representation(threshold, best_representation)
+    )[:, 1]
+    holdout_scores = best_model.predict_proba(
+        build_representation(holdout, best_representation)
+    )[:, 1]
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -234,20 +438,28 @@ def main() -> None:
     cv_results.to_csv(outdir / "verifier_cv_results.csv", index=False)
 
     selection = {
-        "selected_model": str(best["model"]),
-        "selected_C": float(best["C"]),
-        "selection_rule": "highest mean CV F1 on train; precision then recall as tie-breakers",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": get_git_commit(),
+        "selected_candidate": str(best["name"]),
+        "selected_representation": best_representation,
+        "selected_feature_kind": best_feature_kind,
+        "selected_C": best_c,
+        "selection_rule": (
+            "highest mean train-only repeated-CV F1; then lower F1 std; "
+            "then precision; then recall"
+        ),
         "cv_f1_mean": float(best["cv_f1_mean"]),
         "cv_f1_std": float(best["cv_f1_std"]),
         "cv_precision_mean": float(best["cv_precision_mean"]),
         "cv_recall_mean": float(best["cv_recall_mean"]),
-        "cv_folds": int(best["cv_folds"]),
-        "train_rows": int(len(train)),
-        "threshold_rows": int(len(threshold)),
-        "holdout_rows": int(len(holdout)),
+        "cv_folds_total": int(best["cv_folds_total"]),
+        "cv_repeats": int(args.cv_repeats),
+        "train": split_summary(train),
+        "threshold": split_summary(threshold),
+        "holdout": split_summary(holdout),
         "note": (
-            "No threshold is selected here. Send the two id,score files to the "
-            "shared evaluator so threshold choice is identical for the whole team."
+            "No threshold is selected here. threshold/holdout labels are not used "
+            "for model selection. Send the two id,score files to the shared evaluator."
         ),
     }
 
@@ -255,13 +467,25 @@ def main() -> None:
         json.dump(selection, f, ensure_ascii=False, indent=2)
 
     joblib.dump(
-        {"model": best_model, "selection": selection},
+        {
+            "model": best_model,
+            "representation": best_representation,
+            "tail_chars": TAIL_CHARS,
+            "selection": selection,
+        },
         outdir / "verifier.joblib",
     )
 
     print("Done.")
-    print(f"Selected model: {selection['selected_model']}  C={selection['selected_C']}")
-    print(f"CV F1: {selection['cv_f1_mean']:.4f} +/- {selection['cv_f1_std']:.4f}")
+    print(
+        "Selected: "
+        f"{selection['selected_candidate']} "
+        f"(representation={best_representation}, features={best_feature_kind}, C={best_c})"
+    )
+    print(
+        f"Repeated-CV F1: {selection['cv_f1_mean']:.4f} "
+        f"+/- {selection['cv_f1_std']:.4f}"
+    )
     print(f"Scores: {outdir / 'verifier_threshold_scores.csv'}")
     print(f"Scores: {outdir / 'verifier_holdout_scores.csv'}")
     print("Threshold is NOT chosen in this script.")
