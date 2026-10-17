@@ -13,6 +13,7 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import RepeatedStratifiedKFold, cross_validate
+from sklearn.svm import LinearSVC
 from sklearn.pipeline import FeatureUnion, Pipeline
 
 
@@ -373,7 +374,11 @@ def build_representation(df: pd.DataFrame, mode: str) -> pd.Series:
     raise ValueError(f"Unknown representation: {mode}")
 
 
-def make_model(feature_kind: str, c_value: float) -> Pipeline:
+def make_model(
+    feature_kind: str,
+    c_value: float,
+    classifier: str = "logreg",
+) -> Pipeline:
     if feature_kind == "word":
         features = TfidfVectorizer(
             analyzer="word",
@@ -412,20 +417,32 @@ def make_model(feature_kind: str, c_value: float) -> Pipeline:
     else:
         raise ValueError(f"Unknown feature kind: {feature_kind}")
 
-    return Pipeline(
-        [
-            ("features", features),
-            (
-                "clf",
-                LogisticRegression(
-                    C=c_value,
-                    max_iter=3000,
-                    class_weight="balanced",
-                    random_state=RANDOM_STATE,
-                ),
-            ),
-        ]
-    )
+    if classifier == "logreg":
+        clf = LogisticRegression(
+            C=c_value,
+            max_iter=3000,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        )
+    elif classifier == "linear_svc":
+        clf = LinearSVC(
+            C=c_value,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        )
+    else:
+        raise ValueError(f"Unknown classifier: {classifier}")
+
+    return Pipeline([("features", features), ("clf", clf)])
+
+
+def model_scores(model: Pipeline, x: pd.Series) -> list[float]:
+    """Return a continuous score; the shared evaluator chooses the threshold."""
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(x)[:, 1]
+    if hasattr(model, "decision_function"):
+        return model.decision_function(x)
+    raise TypeError("Selected model has neither predict_proba nor decision_function")
 
 
 def candidate_specs() -> list[dict]:
@@ -434,6 +451,7 @@ def candidate_specs() -> list[dict]:
             "name": "legacy_full_word",
             "representation": "full",
             "feature_kind": "word",
+            "classifier": "logreg",
             "C": 1.0,
         }
     ]
@@ -446,6 +464,7 @@ def candidate_specs() -> list[dict]:
                 "name": "response_word",
                 "representation": "response",
                 "feature_kind": "word",
+                "classifier": "logreg",
                 "C": c_value,
             }
         )
@@ -454,6 +473,7 @@ def candidate_specs() -> list[dict]:
                 "name": "response_word_char",
                 "representation": "response",
                 "feature_kind": "word_char",
+                "classifier": "logreg",
                 "C": c_value,
             }
         )
@@ -462,6 +482,7 @@ def candidate_specs() -> list[dict]:
                 "name": "tail8k_word",
                 "representation": "tail8k",
                 "feature_kind": "word",
+                "classifier": "logreg",
                 "C": c_value,
             }
         )
@@ -470,6 +491,7 @@ def candidate_specs() -> list[dict]:
                 "name": "response_support_word_char",
                 "representation": "response_support",
                 "feature_kind": "word_char",
+                "classifier": "logreg",
                 "C": c_value,
             }
         )
@@ -478,6 +500,7 @@ def candidate_specs() -> list[dict]:
                 "name": "tail8k_support_word_char",
                 "representation": "tail8k_support",
                 "feature_kind": "word_char",
+                "classifier": "logreg",
                 "C": c_value,
             }
         )
@@ -486,6 +509,7 @@ def candidate_specs() -> list[dict]:
                 "name": "retrieved_word_char",
                 "representation": "retrieved",
                 "feature_kind": "word_char",
+                "classifier": "logreg",
                 "C": c_value,
             }
         )
@@ -494,6 +518,39 @@ def candidate_specs() -> list[dict]:
                 "name": "retrieved_support_word_char",
                 "representation": "retrieved_support",
                 "feature_kind": "word_char",
+                "classifier": "logreg",
+                "C": c_value,
+            }
+        )
+
+    # LinearSVC is often very strong on tiny sparse text datasets. Its raw
+    # decision_function is a valid score because the shared evaluator chooses
+    # the threshold separately.
+    for c_value in (0.1, 0.25, 0.5, 1.0):
+        specs.append(
+            {
+                "name": "response_word_svc",
+                "representation": "response",
+                "feature_kind": "word",
+                "classifier": "linear_svc",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "response_word_char_svc",
+                "representation": "response",
+                "feature_kind": "word_char",
+                "classifier": "linear_svc",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "retrieved_support_word_char_svc",
+                "representation": "retrieved_support",
+                "feature_kind": "word_char",
+                "classifier": "linear_svc",
                 "C": c_value,
             }
         )
@@ -529,7 +586,11 @@ def evaluate_candidates(
             )
 
         x_train = representation_cache[representation]
-        model = make_model(spec["feature_kind"], float(spec["C"]))
+        model = make_model(
+            spec["feature_kind"],
+            float(spec["C"]),
+            str(spec.get("classifier", "logreg")),
+        )
 
         started = time.perf_counter()
         scores = cross_validate(
@@ -629,17 +690,20 @@ def main() -> None:
 
     best_representation = str(best["representation"])
     best_feature_kind = str(best["feature_kind"])
+    best_classifier = str(best.get("classifier", "logreg"))
     best_c = float(best["C"])
 
-    best_model = make_model(best_feature_kind, best_c)
+    best_model = make_model(best_feature_kind, best_c, best_classifier)
     best_model.fit(build_representation(train, best_representation), train["label"])
 
-    threshold_scores = best_model.predict_proba(
-        build_representation(threshold, best_representation)
-    )[:, 1]
-    holdout_scores = best_model.predict_proba(
-        build_representation(holdout, best_representation)
-    )[:, 1]
+    threshold_scores = model_scores(
+        best_model,
+        build_representation(threshold, best_representation),
+    )
+    holdout_scores = model_scores(
+        best_model,
+        build_representation(holdout, best_representation),
+    )
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -658,6 +722,7 @@ def main() -> None:
         "selected_candidate": str(best["name"]),
         "selected_representation": best_representation,
         "selected_feature_kind": best_feature_kind,
+        "selected_classifier": best_classifier,
         "selected_C": best_c,
         "selection_rule": (
             "highest mean train-only repeated-CV F1; then lower F1 std; "
@@ -695,7 +760,8 @@ def main() -> None:
     print(
         "Selected: "
         f"{selection['selected_candidate']} "
-        f"(representation={best_representation}, features={best_feature_kind}, C={best_c})"
+        f"(representation={best_representation}, features={best_feature_kind}, "
+        f"classifier={best_classifier}, C={best_c})"
     )
     print(
         f"Repeated-CV F1: {selection['cv_f1_mean']:.4f} "
