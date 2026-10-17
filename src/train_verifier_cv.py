@@ -25,8 +25,49 @@ SPECIAL_TOKEN_RE = re.compile(
     r"[A-Za-zА-Яа-яЁё0-9_.:-]*\d[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_.:-]*)\b"
 )
 NUMBER_RE = re.compile(r"(?<![\w])\d{2,}(?:[.,:/-]\d+)*(?![\w])")
+DATE_RE = re.compile(
+    r"\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|"
+    r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b"
+)
+TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{4,}")
 TOOL_CALL_RE = re.compile(r"TOOL_CALL\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+TOOL_RESULT_MARKER_RE = re.compile(r"TOOL_RESULT", re.IGNORECASE)
+
+STATUS_TERMS = {
+    "active",
+    "inactive",
+    "approved",
+    "rejected",
+    "pending",
+    "completed",
+    "failed",
+    "success",
+    "successful",
+    "cancelled",
+    "canceled",
+    "confirmed",
+    "processing",
+    "open",
+    "closed",
+    "активен",
+    "активна",
+    "неактивен",
+    "одобрено",
+    "отклонено",
+    "ожидает",
+    "ожидание",
+    "выполнено",
+    "завершено",
+    "ошибка",
+    "успешно",
+    "отменено",
+    "подтверждено",
+    "подтверждён",
+    "обрабатывается",
+    "открыт",
+    "закрыт",
+}
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -112,22 +153,38 @@ def _normalize_token(token: str) -> str:
     return token.lower().strip(" \t\n\r.,;:!?()[]{}<>\"'")
 
 
+def _extract_statuses(text: str) -> set[str]:
+    words = {_normalize_token(x) for x in WORD_RE.findall(text)}
+    return {x for x in words if x in STATUS_TERMS}
+
+
 def support_signature(prompt: str, response: str) -> str:
     """
-    Build cheap relational features available at inference time.
+    Build relational features that compare a response with its own context.
 
-    They do not use label/explanation. They only compare the candidate response
-    with its own prompt and therefore are safe for the hidden test.
+    No labels/explanations are used here. Every feature is available at hidden-test
+    inference time, so this does not create leakage.
     """
     prompt_lower = prompt.lower()
 
     special_tokens = [_normalize_token(x) for x in SPECIAL_TOKEN_RE.findall(response)]
     number_tokens = [_normalize_token(x) for x in NUMBER_RE.findall(response)]
+    date_tokens = [_normalize_token(x) for x in DATE_RE.findall(response)]
+    time_tokens = [_normalize_token(x) for x in TIME_RE.findall(response)]
     tool_calls = [x.lower() for x in TOOL_CALL_RE.findall(response)]
 
     unseen_specials = [x for x in special_tokens if x and x not in prompt_lower]
     unseen_numbers = [x for x in number_tokens if x and x not in prompt_lower]
+    unseen_dates = [x for x in date_tokens if x and x not in prompt_lower]
+    unseen_times = [x for x in time_tokens if x and x not in prompt_lower]
     unseen_tools = [x for x in tool_calls if x and x not in prompt_lower]
+
+    prompt_statuses = _extract_statuses(prompt)
+    response_statuses = _extract_statuses(response)
+    unseen_statuses = sorted(response_statuses - prompt_statuses)
+    status_changed = bool(
+        prompt_statuses and response_statuses and not (prompt_statuses & response_statuses)
+    )
 
     response_words = {x.lower() for x in WORD_RE.findall(response)}
     prompt_words = {x.lower() for x in WORD_RE.findall(prompt)}
@@ -138,17 +195,31 @@ def support_signature(prompt: str, response: str) -> str:
     )
     overlap_bucket = min(9, int(overlap_ratio * 10))
 
+    has_tool_result = bool(TOOL_RESULT_MARKER_RE.search(prompt))
+
     features = [
         "SUPPORT_SIGNATURE",
         f"WORD_OVERLAP_{overlap_bucket}",
+        f"HAS_TOOL_RESULT_{int(has_tool_result)}",
         f"UNSEEN_SPECIAL_COUNT_{min(len(unseen_specials), 5)}",
         f"UNSEEN_NUMBER_COUNT_{min(len(unseen_numbers), 5)}",
+        f"UNSEEN_DATE_COUNT_{min(len(unseen_dates), 3)}",
+        f"UNSEEN_TIME_COUNT_{min(len(unseen_times), 3)}",
+        f"UNSEEN_STATUS_COUNT_{min(len(unseen_statuses), 3)}",
         f"UNSEEN_TOOL_COUNT_{min(len(unseen_tools), 3)}",
+        f"STATUS_CHANGED_{int(status_changed)}",
     ]
 
-    # Keep a few concrete unseen structured values. This is intentionally capped
-    # so a long response cannot explode the feature space.
+    if has_tool_result and (
+        unseen_specials or unseen_numbers or unseen_dates or unseen_statuses
+    ):
+        features.append("UNSUPPORTED_AFTER_TOOL_RESULT")
+
+    # Keep only a few concrete values so one long answer cannot explode the
+    # feature space. Counts above remain available for all examples.
     features.extend(f"UNSEEN_SPECIAL_{x}" for x in unseen_specials[:8])
+    features.extend(f"UNSEEN_DATE_{x}" for x in unseen_dates[:4])
+    features.extend(f"UNSEEN_STATUS_{x}" for x in unseen_statuses[:4])
     features.extend(f"UNSEEN_TOOL_{x}" for x in unseen_tools[:4])
     return " ".join(features)
 
@@ -173,6 +244,19 @@ def build_representation(df: pd.DataFrame, mode: str) -> pd.Series:
         for prompt, response in zip(df["prompt"], df["response"]):
             values.append(
                 "[RESPONSE] "
+                + response
+                + " [RELATIONAL_FEATURES] "
+                + support_signature(prompt, response)
+            )
+        return pd.Series(values, index=df.index)
+
+    if mode == "tail8k_support":
+        values = []
+        for prompt, response in zip(df["prompt"], df["response"]):
+            values.append(
+                "[PROMPT_TAIL] "
+                + prompt[-TAIL_CHARS:]
+                + " [RESPONSE] "
                 + response
                 + " [RELATIONAL_FEATURES] "
                 + support_signature(prompt, response)
@@ -278,6 +362,14 @@ def candidate_specs() -> list[dict]:
             {
                 "name": "response_support_word_char",
                 "representation": "response_support",
+                "feature_kind": "word_char",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "tail8k_support_word_char",
+                "representation": "tail8k_support",
                 "feature_kind": "word_char",
                 "C": c_value,
             }
