@@ -34,6 +34,11 @@ TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{4,}")
 TOOL_CALL_RE = re.compile(r"TOOL_CALL\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
 TOOL_RESULT_MARKER_RE = re.compile(r"TOOL_RESULT", re.IGNORECASE)
+TOOL_CALL_MARKER_RE = re.compile(
+    r"TOOL_CALL\s+([A-Za-z_][A-Za-z0-9_]*)\s*:",
+    re.IGNORECASE,
+)
+JSON_KEY_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:')
 MESSAGE_SPLIT_RE = re.compile(
     r"(?=^(?:SYSTEM|USER|ASSISTANT|ASSISTANT_TOOL_CALL|USER_TOOL_CALL|TOOL_RESULT)\b)",
     re.IGNORECASE | re.MULTILINE,
@@ -242,6 +247,123 @@ def retrieve_context(
     return text[-max_chars:]
 
 
+def _available_tools_section(prompt: str) -> str:
+    marker = "[AVAILABLE TOOLS]"
+    start = prompt.find(marker)
+    if start < 0:
+        return ""
+    section = prompt[start + len(marker) :]
+
+    # Tool declarations are before the conversation transcript in the contest
+    # prompts. Stop at the first transcript marker to avoid treating historical
+    # tool calls as "available tools".
+    positions = [
+        pos
+        for token in ("⟦ASSISTANT", "⟦USER", "⟦SYSTEM")
+        if (pos := section.find(token)) >= 0
+    ]
+    if positions:
+        section = section[: min(positions)]
+    return section
+
+
+def _available_tool_names(prompt: str) -> set[str]:
+    section = _available_tools_section(prompt)
+    return {
+        name.lower()
+        for name in re.findall(
+            r"(?m)^\s*-\s*([A-Za-z_][A-Za-z0-9_]*)\s+(?:—|-)",
+            section,
+        )
+    }
+
+
+def _tool_schema_blocks(prompt: str) -> dict[str, str]:
+    section = _available_tools_section(prompt)
+    matches = list(
+        re.finditer(
+            r"(?m)^\s*-\s*([A-Za-z_][A-Za-z0-9_]*)\s+(?:—|-)",
+            section,
+        )
+    )
+    blocks: dict[str, str] = {}
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(section)
+        blocks[match.group(1).lower()] = section[match.start() : end]
+    return blocks
+
+
+def _required_schema_keys(prompt: str) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {}
+    for tool_name, block in _tool_schema_blocks(prompt).items():
+        keys = set(
+            re.findall(
+                r"(?m)^\s*(?:·\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^\n]*!",
+                block,
+            )
+        )
+        result[tool_name] = {x.lower() for x in keys}
+    return result
+
+
+def _response_tool_calls(response: str) -> list[tuple[str, str]]:
+    matches = list(TOOL_CALL_MARKER_RE.finditer(response))
+    calls: list[tuple[str, str]] = []
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
+        raw_args = response[match.end() : end]
+        calls.append((match.group(1).lower(), raw_args))
+    return calls
+
+
+def tool_schema_signature(prompt: str, response: str) -> list[str]:
+    """
+    Structural contest-specific checks for actual TOOL_CALLs in the response.
+
+    These are deliberately conservative. They do not mark a sample by
+    themselves; they become features for the ML verifier.
+    """
+    calls = _response_tool_calls(response)
+    available = _available_tool_names(prompt)
+    required_by_tool = _required_schema_keys(prompt)
+
+    unavailable_count = 0
+    previously_failed_count = 0
+    missing_required_count = 0
+    placeholder_count = 0
+
+    for tool_name, raw_args in calls:
+        if available and tool_name not in available:
+            unavailable_count += 1
+
+        failed_pattern = re.compile(
+            rf"Tool\s+['\"]{re.escape(tool_name)}['\"]\s+not\s+found",
+            re.IGNORECASE,
+        )
+        if failed_pattern.search(prompt):
+            previously_failed_count += 1
+
+        present_keys = {x.lower() for x in JSON_KEY_RE.findall(raw_args)}
+        required_keys = required_by_tool.get(tool_name, set())
+        if required_keys:
+            missing_required_count += len(required_keys - present_keys)
+
+        if re.search(
+            r"placeholder|\bunknown\b|\bTODO\b|dummy[_ -]?id|fake[_ -]?id",
+            raw_args,
+            re.IGNORECASE,
+        ):
+            placeholder_count += 1
+
+    return [
+        f"TOOL_CALL_COUNT_{min(len(calls), 5)}",
+        f"UNAVAILABLE_ACTUAL_TOOL_COUNT_{min(unavailable_count, 4)}",
+        f"PREVIOUSLY_FAILED_TOOL_COUNT_{min(previously_failed_count, 4)}",
+        f"MISSING_REQUIRED_TOOL_KEY_COUNT_{min(missing_required_count, 6)}",
+        f"PLACEHOLDER_TOOL_ARG_COUNT_{min(placeholder_count, 3)}",
+    ]
+
+
 def support_signature(prompt: str, response: str) -> str:
     """
     Build relational features that compare a response with its own context.
@@ -283,6 +405,7 @@ def support_signature(prompt: str, response: str) -> str:
 
     features = [
         "SUPPORT_SIGNATURE",
+        *tool_schema_signature(prompt, response),
         f"WORD_OVERLAP_{overlap_bucket}",
         f"HAS_TOOL_RESULT_{int(has_tool_result)}",
         f"UNSEEN_SPECIAL_COUNT_{min(len(unseen_specials), 5)}",
@@ -488,6 +611,15 @@ def candidate_specs() -> list[dict]:
         )
         specs.append(
             {
+                "name": "response_support_word",
+                "representation": "response_support",
+                "feature_kind": "word",
+                "classifier": "logreg",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
                 "name": "response_support_word_char",
                 "representation": "response_support",
                 "feature_kind": "word_char",
@@ -541,6 +673,15 @@ def candidate_specs() -> list[dict]:
                 "name": "response_word_char_svc",
                 "representation": "response",
                 "feature_kind": "word_char",
+                "classifier": "linear_svc",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "response_support_word_svc",
+                "representation": "response_support",
+                "feature_kind": "word",
                 "classifier": "linear_svc",
                 "C": c_value,
             }
