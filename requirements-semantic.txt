@@ -1,0 +1,6 @@
+# Optional dependencies for src/run_semantic_verifier.py
+# Kept separate so the lightweight baseline remains easy to run.
+torch
+transformers>=4.48
+sentencepiece
+safetensors
