@@ -25,7 +25,7 @@ from train_verifier_cv import (
 )
 
 
-DEFAULT_MODEL = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
+DEFAULT_MODEL = "MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli"
 WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{3,}")
 STRUCTURED_RE = re.compile(
     r"\b(?:[A-Za-zА-Яа-яЁё_]*\d[A-Za-zА-Яа-яЁё0-9_.:#/-]*|"
@@ -423,8 +423,8 @@ def main() -> None:
     parser.add_argument("--outdir", default="outputs")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=int, default=12)
-    parser.add_argument("--max-claims", type=int, default=6)
-    parser.add_argument("--chunks-per-claim", type=int, default=3)
+    parser.add_argument("--max-claims", type=int, default=4)
+    parser.add_argument("--chunks-per-claim", type=int, default=2)
     parser.add_argument("--cv-repeats", type=int, default=3)
     args = parser.parse_args()
 
@@ -451,6 +451,7 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    print("Semantic features: train...")
     train_sem = semantic_features(
         train,
         model,
@@ -460,6 +461,7 @@ def main() -> None:
         args.max_claims,
         args.chunks_per_claim,
     )
+    print("Semantic features: threshold...")
     threshold_sem = semantic_features(
         threshold,
         model,
@@ -469,6 +471,7 @@ def main() -> None:
         args.max_claims,
         args.chunks_per_claim,
     )
+    print("Semantic features: holdout...")
     holdout_sem = semantic_features(
         holdout,
         model,
@@ -483,6 +486,7 @@ def main() -> None:
     threshold_sem.to_csv(outdir / "semantic_threshold_features.csv", index=False)
     holdout_sem.to_csv(outdir / "semantic_holdout_features.csv", index=False)
 
+    print("Cross-validation...")
     cv_results, best = evaluate_candidates(
         train,
         train_sem,
