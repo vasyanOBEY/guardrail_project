@@ -33,6 +33,10 @@ TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{4,}")
 TOOL_CALL_RE = re.compile(r"TOOL_CALL\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
 TOOL_RESULT_MARKER_RE = re.compile(r"TOOL_RESULT", re.IGNORECASE)
+MESSAGE_SPLIT_RE = re.compile(
+    r"(?=^(?:SYSTEM|USER|ASSISTANT|ASSISTANT_TOOL_CALL|USER_TOOL_CALL|TOOL_RESULT)\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 STATUS_TERMS = {
     "active",
@@ -158,6 +162,85 @@ def _extract_statuses(text: str) -> set[str]:
     return {x for x in words if x in STATUS_TERMS}
 
 
+def _chunk_prompt(prompt: str, max_chunk_chars: int = 2200) -> list[str]:
+    parts = [x.strip() for x in MESSAGE_SPLIT_RE.split(prompt) if x.strip()]
+    if len(parts) <= 1:
+        parts = [x.strip() for x in re.split(r"\n\s*\n", prompt) if x.strip()]
+    if not parts:
+        return [prompt]
+
+    chunks: list[str] = []
+    for part in parts:
+        if len(part) <= max_chunk_chars:
+            chunks.append(part)
+            continue
+
+        step = max_chunk_chars - 250
+        for start in range(0, len(part), step):
+            piece = part[start : start + max_chunk_chars].strip()
+            if piece:
+                chunks.append(piece)
+            if start + max_chunk_chars >= len(part):
+                break
+    return chunks
+
+
+def retrieve_context(
+    prompt: str,
+    response: str,
+    max_chunks: int = 4,
+    max_chars: int = 8000,
+) -> str:
+    """
+    Select a few prompt fragments that are most relevant to the response.
+
+    Retrieval is label-free: it uses only lexical overlap, structured values
+    (numbers/IDs/dates/times), TOOL_RESULT presence and a tiny recency bonus.
+    """
+    chunks = _chunk_prompt(prompt)
+    if not chunks:
+        return prompt[-max_chars:]
+
+    response_words = {x.lower() for x in WORD_RE.findall(response)}
+    structured = {
+        _normalize_token(x)
+        for regex in (SPECIAL_TOKEN_RE, NUMBER_RE, DATE_RE, TIME_RE)
+        for x in regex.findall(response)
+        if _normalize_token(x)
+    }
+
+    scored: list[tuple[float, int, str]] = []
+    total = max(1, len(chunks) - 1)
+
+    for idx, chunk in enumerate(chunks):
+        chunk_lower = chunk.lower()
+        chunk_words = {x.lower() for x in WORD_RE.findall(chunk)}
+        lexical_overlap = (
+            len(response_words & chunk_words) / max(1, len(response_words))
+        )
+        structured_hits = sum(1 for token in structured if token in chunk_lower)
+
+        score = lexical_overlap
+        score += 0.35 * structured_hits
+        if TOOL_RESULT_MARKER_RE.search(chunk):
+            score += 0.10
+        score += 0.05 * (idx / total)
+
+        scored.append((score, idx, chunk))
+
+    best = sorted(scored, key=lambda x: (x[0], x[1]), reverse=True)[:max_chunks]
+
+    # Keep the newest message too. It is often the immediate context for the
+    # response and costs little compared with feeding the whole prompt.
+    newest_idx = len(chunks) - 1
+    if all(idx != newest_idx for _, idx, _ in best):
+        best[-1] = (scored[newest_idx][0], newest_idx, chunks[newest_idx])
+
+    selected = sorted(best, key=lambda x: x[1])
+    text = "\n\n".join(chunk for _, _, chunk in selected)
+    return text[-max_chars:]
+
+
 def support_signature(prompt: str, response: str) -> str:
     """
     Build relational features that compare a response with its own context.
@@ -256,6 +339,30 @@ def build_representation(df: pd.DataFrame, mode: str) -> pd.Series:
             values.append(
                 "[PROMPT_TAIL] "
                 + prompt[-TAIL_CHARS:]
+                + " [RESPONSE] "
+                + response
+                + " [RELATIONAL_FEATURES] "
+                + support_signature(prompt, response)
+            )
+        return pd.Series(values, index=df.index)
+
+    if mode == "retrieved":
+        values = []
+        for prompt, response in zip(df["prompt"], df["response"]):
+            values.append(
+                "[RETRIEVED_CONTEXT] "
+                + retrieve_context(prompt, response)
+                + " [RESPONSE] "
+                + response
+            )
+        return pd.Series(values, index=df.index)
+
+    if mode == "retrieved_support":
+        values = []
+        for prompt, response in zip(df["prompt"], df["response"]):
+            values.append(
+                "[RETRIEVED_CONTEXT] "
+                + retrieve_context(prompt, response)
                 + " [RESPONSE] "
                 + response
                 + " [RELATIONAL_FEATURES] "
@@ -370,6 +477,22 @@ def candidate_specs() -> list[dict]:
             {
                 "name": "tail8k_support_word_char",
                 "representation": "tail8k_support",
+                "feature_kind": "word_char",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "retrieved_word_char",
+                "representation": "retrieved",
+                "feature_kind": "word_char",
+                "C": c_value,
+            }
+        )
+        specs.append(
+            {
+                "name": "retrieved_support_word_char",
+                "representation": "retrieved_support",
                 "feature_kind": "word_char",
                 "C": c_value,
             }
