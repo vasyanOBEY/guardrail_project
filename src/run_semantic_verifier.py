@@ -166,7 +166,10 @@ def infer_pairs(
     entail_id, neutral_id, contradiction_id = get_label_ids(model)
     results: list[tuple[float, float, float]] = []
 
-    for start in range(0, len(premises), batch_size):
+    total_batches = max(1, math.ceil(len(premises) / batch_size))
+    for batch_idx, start in enumerate(range(0, len(premises), batch_size), start=1):
+        if batch_idx == 1 or batch_idx % 5 == 0 or batch_idx == total_batches:
+            print(f"  NLI batch {batch_idx}/{total_batches}", flush=True)
         batch_premises = premises[start : start + batch_size]
         batch_hypotheses = hypotheses[start : start + batch_size]
         encoded = tokenizer(
@@ -451,6 +454,7 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    print("Semantic features: train...", flush=True)
     train_sem = semantic_features(
         train,
         model,
@@ -460,6 +464,7 @@ def main() -> None:
         args.max_claims,
         args.chunks_per_claim,
     )
+    print("Semantic features: threshold...", flush=True)
     threshold_sem = semantic_features(
         threshold,
         model,
@@ -469,6 +474,7 @@ def main() -> None:
         args.max_claims,
         args.chunks_per_claim,
     )
+    print("Semantic features: holdout...", flush=True)
     holdout_sem = semantic_features(
         holdout,
         model,
@@ -483,6 +489,7 @@ def main() -> None:
     threshold_sem.to_csv(outdir / "semantic_threshold_features.csv", index=False)
     holdout_sem.to_csv(outdir / "semantic_holdout_features.csv", index=False)
 
+    print("Cross-validation...", flush=True)
     cv_results, best = evaluate_candidates(
         train,
         train_sem,
